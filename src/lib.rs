@@ -381,9 +381,15 @@ mod simd {
     pub(crate) fn search_tags(tags: &[u8], needle: u8, ways: u64) -> u64 {
         #[cfg(target_arch = "x86_64")]
         {
-            if ways == 16 && is_x86_feature_detected!("sse2") {
-                // SAFETY: tags slice has 16 elements and is 16-byte aligned (from AlignedBuf).
-                return unsafe { search_tags_16_sse2(tags, needle) };
+            if ways == 16 {
+                if is_x86_feature_detected!("avx512bw") {
+                    // SAFETY: tags slice has 16 elements and is 64-byte aligned (from AlignedBuf).
+                    return unsafe { search_tags_16_avx512(tags, needle) };
+                }
+                if is_x86_feature_detected!("sse2") {
+                    // SAFETY: tags slice has 16 elements and is 16-byte aligned (from AlignedBuf).
+                    return unsafe { search_tags_16_sse2(tags, needle) };
+                }
             }
         }
         search_tags_scalar(tags, needle, ways)
@@ -396,6 +402,10 @@ mod simd {
         #[cfg(target_arch = "x86_64")]
         {
             if ways == 16 {
+                if is_x86_feature_detected!("avx512bw") {
+                    // SAFETY: tags slice has 16 elements and is 64-byte aligned (from AlignedBuf).
+                    return unsafe { search_tags_u16_16_avx512(tags, needle) };
+                }
                 if is_x86_feature_detected!("avx2") {
                     // SAFETY: tags slice has 16 elements and is 32-byte aligned (from AlignedBuf).
                     return unsafe { search_tags_u16_16_avx2(tags, needle) };
@@ -407,6 +417,36 @@ mod simd {
             }
         }
         search_tags_u16_scalar(tags, needle, ways)
+    }
+
+    // ---- x86_64 AVX-512: 16 × u8 (single 128-bit compare with mask result) ----
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512bw,avx512vl")]
+    unsafe fn search_tags_16_avx512(tags: &[u8], needle: u8) -> u64 {
+        use std::arch::x86_64::*;
+        // AVX-512 cmpeq returns a __mmask directly — no movemask/packs needed.
+        unsafe {
+            let data = _mm_load_si128(tags.as_ptr().cast::<__m128i>());
+            let splat = _mm_set1_epi8(needle as i8);
+            let mask = _mm_cmpeq_epi8_mask(data, splat);
+            (mask & 0xFFFF) as u64
+        }
+    }
+
+    // ---- x86_64 AVX-512: 16 × u16 (single 256-bit compare with mask result) ----
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx512bw,avx512vl")]
+    unsafe fn search_tags_u16_16_avx512(tags: &[u16], needle: u16) -> u64 {
+        use std::arch::x86_64::*;
+        // 16 × u16 = 32 bytes = one __m256i. AVX-512 cmpeq returns mask directly.
+        unsafe {
+            let data = _mm256_load_si256(tags.as_ptr().cast::<__m256i>());
+            let splat = _mm256_set1_epi16(needle as i16);
+            let mask = _mm256_cmpeq_epi16_mask(data, splat);
+            (mask & 0xFFFF) as u64
+        }
     }
 
     // ---- x86_64 SSE2: 16 × u8 ----
@@ -597,8 +637,8 @@ where
             value_count_max_multiple,
         );
 
-        // Tags: align to max(cache_line_size, 32) for AVX2 _mm256_load_si256
-        let tag_align = cache_line_size.max(32);
+        // Tags: align for SIMD loads (SSE2=16, AVX2=32, AVX-512=64).
+        let tag_align = cache_line_size.max(64);
         let tag_store = match L::TAG_BITS {
             8 => TagStore::U8(AlignedBuf::alloc_zeroed(
                 value_count_max as usize,
@@ -1192,9 +1232,14 @@ mod tests {
 
         let mut rng = SmallRng::seed_from_u64(42);
 
+        // Aligned buffer on the stack for SIMD loads (32-byte aligned covers both SSE2 and AVX2).
+        #[repr(C, align(32))]
+        struct AlignedTags([u8; 16]);
+
         for ways in [2u64, 4, 16] {
             for _ in 0..10_000 {
-                let mut tags = vec![0u8; ways as usize];
+                let mut buf = AlignedTags([0u8; 16]);
+                let tags = &mut buf.0[..ways as usize];
                 for t in tags.iter_mut() {
                     *t = rng.random();
                 }
@@ -1220,10 +1265,11 @@ mod tests {
                     }
                 }
 
-                let actual = simd::search_tags(&tags, needle, ways);
+                let actual = simd::search_tags(&buf.0[..ways as usize], needle, ways);
                 assert_eq!(
                     expected, actual,
-                    "ways={ways} needle={needle} tags={tags:?}"
+                    "ways={ways} needle={needle} tags={:?}",
+                    &buf.0[..ways as usize]
                 );
             }
         }
