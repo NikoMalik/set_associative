@@ -425,7 +425,7 @@ mod simd {
     #[target_feature(enable = "avx512bw,avx512vl")]
     unsafe fn search_tags_16_avx512(tags: &[u8], needle: u8) -> u64 {
         use std::arch::x86_64::*;
-        // AVX-512 cmpeq returns a __mmask directly — no movemask/packs needed.
+        // SAFETY: caller guarantees tags is 16-byte aligned and has >= 16 elements.
         unsafe {
             let data = _mm_load_si128(tags.as_ptr().cast::<__m128i>());
             let splat = _mm_set1_epi8(needle as i8);
@@ -440,7 +440,7 @@ mod simd {
     #[target_feature(enable = "avx512bw,avx512vl")]
     unsafe fn search_tags_u16_16_avx512(tags: &[u16], needle: u16) -> u64 {
         use std::arch::x86_64::*;
-        // 16 × u16 = 32 bytes = one __m256i. AVX-512 cmpeq returns mask directly.
+        // SAFETY: caller guarantees tags is 32-byte aligned and has >= 16 elements.
         unsafe {
             let data = _mm256_load_si256(tags.as_ptr().cast::<__m256i>());
             let splat = _mm256_set1_epi16(needle as i16);
