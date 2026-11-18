@@ -375,74 +375,50 @@ impl PackedArray {
 }
 
 mod simd {
+    /// Searcher for `u16` tags, picked once per cache by [`u16_searcher`].
+    pub(crate) type U16Search = unsafe fn(&[u16], u16, u64) -> u64;
+
     /// Compare `ways` u8 tags against `needle`, return bitmask of matching positions.
-    /// Runtime SIMD on x86_64 (SSE2), scalar fallback everywhere else.
-    #[inline]
+    /// SSE2 is part of the x86_64 baseline, so the 16-way path needs no runtime check
+    /// and inlines into the caller.
+    #[inline(always)]
     pub(crate) fn search_tags(tags: &[u8], needle: u8, ways: u64) -> u64 {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if ways == 16 {
-                if is_x86_feature_detected!("avx512bw") {
-                    // SAFETY: tags slice has 16 elements and is 64-byte aligned (from AlignedBuf).
-                    return unsafe { search_tags_16_avx512(tags, needle) };
-                }
-                if is_x86_feature_detected!("sse2") {
-                    // SAFETY: tags slice has 16 elements and is 16-byte aligned (from AlignedBuf).
-                    return unsafe { search_tags_16_sse2(tags, needle) };
-                }
-            }
+        #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+        if ways == 16 {
+            return search_tags_16_sse2(tags, needle);
         }
         search_tags_scalar(tags, needle, ways)
     }
 
-    /// Compare `ways` u16 tags against `needle`, return bitmask of matching positions.
-    /// Runtime SIMD on x86_64 (AVX2 -> SSE2), scalar fallback everywhere else.
-    #[inline]
-    pub(crate) fn search_tags_u16(tags: &[u16], needle: u16, ways: u64) -> u64 {
+    /// Pick the `u16` tag searcher for this CPU and way count, run once at cache creation.
+    pub(crate) fn u16_searcher(ways: u64) -> U16Search {
         #[cfg(target_arch = "x86_64")]
-        {
-            if ways == 16 {
-                if is_x86_feature_detected!("avx512bw") {
-                    // SAFETY: tags slice has 16 elements and is 64-byte aligned (from AlignedBuf).
-                    return unsafe { search_tags_u16_16_avx512(tags, needle) };
-                }
-                if is_x86_feature_detected!("avx2") {
-                    // SAFETY: tags slice has 16 elements and is 32-byte aligned (from AlignedBuf).
-                    return unsafe { search_tags_u16_16_avx2(tags, needle) };
-                }
-                if is_x86_feature_detected!("sse2") {
-                    // SAFETY: tags slice has 16 elements and is 16-byte aligned (from AlignedBuf).
-                    return unsafe { search_tags_u16_16_sse2(tags, needle) };
-                }
+        if ways == 16 {
+            if is_x86_feature_detected!("avx512bw") && is_x86_feature_detected!("avx512vl") {
+                return search_tags_u16_16_avx512;
             }
+            if is_x86_feature_detected!("avx2") {
+                return search_tags_u16_16_avx2;
+            }
+            return search_tags_u16_16_sse2;
         }
-        search_tags_u16_scalar(tags, needle, ways)
+        search_tags_u16_scalar_unsafe
     }
 
-    // ---- x86_64 AVX-512: 16 × u8 (single 128-bit compare with mask result) ----
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx512bw,avx512vl")]
-    unsafe fn search_tags_16_avx512(tags: &[u8], needle: u8) -> u64 {
-        use std::arch::x86_64::*;
-        // SAFETY: caller guarantees tags is 16-byte aligned and has >= 16 elements.
-        unsafe {
-            let data = _mm_load_si128(tags.as_ptr().cast::<__m128i>());
-            let splat = _mm_set1_epi8(needle as i8);
-            let mask = _mm_cmpeq_epi8_mask(data, splat);
-            (mask & 0xFFFF) as u64
-        }
+    unsafe fn search_tags_u16_scalar_unsafe(tags: &[u16], needle: u16, ways: u64) -> u64 {
+        search_tags_u16_scalar(tags, needle, ways)
     }
 
     // ---- x86_64 AVX-512: 16 × u16 (single 256-bit compare with mask result) ----
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx512bw,avx512vl")]
-    unsafe fn search_tags_u16_16_avx512(tags: &[u16], needle: u16) -> u64 {
+    unsafe fn search_tags_u16_16_avx512(tags: &[u16], needle: u16, _ways: u64) -> u64 {
         use std::arch::x86_64::*;
-        // SAFETY: caller guarantees tags is 32-byte aligned and has >= 16 elements.
+        assert!(tags.len() >= 16);
+        // SAFETY: tags has at least 16 elements, the load is unaligned.
         unsafe {
-            let data = _mm256_load_si256(tags.as_ptr().cast::<__m256i>());
+            let data = _mm256_loadu_si256(tags.as_ptr().cast::<__m256i>());
             let splat = _mm256_set1_epi16(needle as i16);
             let mask = _mm256_cmpeq_epi16_mask(data, splat);
             (mask & 0xFFFF) as u64
@@ -451,13 +427,15 @@ mod simd {
 
     // ---- x86_64 SSE2: 16 × u8 ----
 
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "sse2")]
-    unsafe fn search_tags_16_sse2(tags: &[u8], needle: u8) -> u64 {
+    #[cfg(all(target_arch = "x86_64", target_feature = "sse2"))]
+    #[inline(always)]
+    fn search_tags_16_sse2(tags: &[u8], needle: u8) -> u64 {
         use std::arch::x86_64::*;
-        // SAFETY: caller guarantees tags is 16-byte aligned and has >= 16 elements.
+        assert!(tags.len() >= 16);
+        // SAFETY: tags has at least 16 elements, the load is unaligned, SSE2 is enabled
+        // at compile time on every x86_64 target.
         unsafe {
-            let data = _mm_load_si128(tags.as_ptr().cast::<__m128i>());
+            let data = _mm_loadu_si128(tags.as_ptr().cast::<__m128i>());
             let splat = _mm_set1_epi8(needle as i8);
             let cmp = _mm_cmpeq_epi8(data, splat);
             let mask = _mm_movemask_epi8(cmp) as u32;
@@ -469,19 +447,19 @@ mod simd {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "sse2")]
-    unsafe fn search_tags_u16_16_sse2(tags: &[u16], needle: u16) -> u64 {
+    unsafe fn search_tags_u16_16_sse2(tags: &[u16], needle: u16, _ways: u64) -> u64 {
         use std::arch::x86_64::*;
-        // SAFETY: caller guarantees tags is 32-byte aligned and has >= 16 elements.
-        // Each half (8 × u16 = 16 bytes) is 16-byte aligned.
+        assert!(tags.len() >= 16);
+        // SAFETY: tags has at least 16 elements, both loads are unaligned.
         unsafe {
             let splat = _mm_set1_epi16(needle as i16);
 
-            let lo = _mm_load_si128(tags.as_ptr().cast::<__m128i>());
+            let lo = _mm_loadu_si128(tags.as_ptr().cast::<__m128i>());
             let cmp_lo = _mm_cmpeq_epi16(lo, splat);
             let packed_lo = _mm_packs_epi16(cmp_lo, _mm_setzero_si128());
             let mask_lo = _mm_movemask_epi8(packed_lo) as u32 & 0xFF;
 
-            let hi = _mm_load_si128(tags.as_ptr().add(8).cast::<__m128i>());
+            let hi = _mm_loadu_si128(tags.as_ptr().add(8).cast::<__m128i>());
             let cmp_hi = _mm_cmpeq_epi16(hi, splat);
             let packed_hi = _mm_packs_epi16(cmp_hi, _mm_setzero_si128());
             let mask_hi = _mm_movemask_epi8(packed_hi) as u32 & 0xFF;
@@ -494,11 +472,12 @@ mod simd {
 
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
-    unsafe fn search_tags_u16_16_avx2(tags: &[u16], needle: u16) -> u64 {
+    unsafe fn search_tags_u16_16_avx2(tags: &[u16], needle: u16, _ways: u64) -> u64 {
         use std::arch::x86_64::*;
-        // SAFETY: caller guarantees tags is 32-byte aligned and has >= 16 elements.
+        assert!(tags.len() >= 16);
+        // SAFETY: tags has at least 16 elements, the load is unaligned.
         unsafe {
-            let data = _mm256_load_si256(tags.as_ptr().cast::<__m256i>());
+            let data = _mm256_loadu_si256(tags.as_ptr().cast::<__m256i>());
             let splat = _mm256_set1_epi16(needle as i16);
             let cmp = _mm256_cmpeq_epi16(data, splat);
             let packed = _mm256_packs_epi16(cmp, _mm256_setzero_si256());
@@ -522,7 +501,7 @@ mod simd {
     }
 
     #[inline]
-    fn search_tags_u16_scalar(tags: &[u16], needle: u16, ways: u64) -> u64 {
+    pub(crate) fn search_tags_u16_scalar(tags: &[u16], needle: u16, ways: u64) -> u64 {
         let mut bits: u64 = 0;
         for (i, &tag) in tags.iter().enumerate().take(ways as usize) {
             if tag == needle {
@@ -579,6 +558,7 @@ pub struct SetAssociativeCache<E: KeyExtract, S: BuildHasher, L: CacheLayout, A:
 {
     sets: u64,
     tag_store: TagStore,
+    search_u16: simd::U16Search,
     values: AlignedBuf<MaybeUninit<E::Value>>,
     counts: PackedArray,
     clocks: PackedArray,
@@ -671,6 +651,7 @@ where
         Self {
             sets,
             tag_store,
+            search_u16: simd::u16_searcher(L::WAYS),
             values,
             counts,
             clocks,
@@ -879,7 +860,9 @@ where
             TagStore::U16(buf) => {
                 let tags = buf.as_slice();
                 let slice = &tags[offset as usize..(offset + ways) as usize];
-                simd::search_tags_u16(slice, set.tag, ways)
+                // SAFETY: search_u16 was picked by u16_searcher for this CPU and L::WAYS,
+                // and the slice holds exactly L::WAYS tags.
+                unsafe { (self.search_u16)(slice, set.tag, ways) }
             }
         };
 
@@ -887,8 +870,11 @@ where
             return None;
         }
 
-        for way in 0..ways {
-            if (matching_ways >> way) & 1 == 1 && self.counts.get(offset + way) > 0 {
+        let mut candidates = matching_ways;
+        while candidates != 0 {
+            let way = u64::from(candidates.trailing_zeros());
+            candidates &= candidates - 1;
+            if self.counts.get(offset + way) > 0 {
                 // SAFETY: count > 0 means the slot was initialized via MaybeUninit::write.
                 let val =
                     unsafe { self.values.as_slice()[(offset + way) as usize].assume_init_ref() };
@@ -1272,6 +1258,27 @@ mod tests {
                     &buf.0[..ways as usize]
                 );
             }
+        }
+    }
+
+    #[test]
+    fn search_tags_u16_every_path_matches_scalar() {
+        use rand::rngs::SmallRng;
+        use rand::{Rng, SeedableRng};
+
+        let mut rng = SmallRng::seed_from_u64(7);
+        let chosen = simd::u16_searcher(16);
+        for _ in 0..10_000 {
+            let mut tags = [0u16; 17];
+            let needle: u16 = rng.random_range(0..4);
+            for t in tags.iter_mut() {
+                *t = rng.random_range(0..4);
+            }
+            let start = rng.random_range(0..=1usize);
+            let slice = &tags[start..start + 16];
+            let expected = simd::search_tags_u16_scalar(slice, needle, 16);
+            // SAFETY: u16_searcher picked a path this CPU supports, the slice holds 16 tags.
+            assert_eq!(unsafe { chosen(slice, needle, 16) }, expected, "tags={slice:?}");
         }
     }
 

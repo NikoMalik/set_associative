@@ -1,6 +1,6 @@
 [package]
 name = "set_associative"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A hardware-optimized, set-associative cache implementation using CLOCK eviction policy highest throughput" 
 license = "Apache-2.0"                                                                                                                                                  
